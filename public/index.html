@@ -776,19 +776,40 @@ async function generate(){
   }
 }
 
-async function pollStatus(token,maxMs=300000){
-  const t0=Date.now(); let si=3;
-  while(Date.now()-t0<maxMs){
-    await sleep(3000);
-    const r=await fetch(`/api/status/${token}`);
-    const d=await r.json().catch(()=>({}));
-    if(d.status==='complete'&&d.audioUrl)return d.audioUrl;
-    if(d.status==='error')throw new Error(d.error||'Generation failed.');
-    const el=(Date.now()-t0)/1000;
-    const newSi=el<12?3:el<28?4:5;
-    if(newSi>si){si=newSi;setStage(si);}
+async function pollStatus(token, maxMs=600000){
+  // 10 minute timeout — Kie.ai can take 2-3 mins, we give plenty of room
+  const t0 = Date.now();
+  let lastStage = '';
+  let errorCount = 0;
+
+  while(Date.now()-t0 < maxMs){
+    await sleep(4000);
+    try {
+      const r = await fetch(`/api/status/${token}`);
+      if(!r.ok){ errorCount++; if(errorCount>5) throw new Error('Server unreachable.'); continue; }
+      errorCount = 0;
+      const d = await r.json().catch(()=>({}));
+
+      // Update UI from server's own stage + pct data
+      if(d.stage && d.stage !== lastStage){
+        lastStage = d.stage;
+        document.getElementById('procStep').textContent = d.stage;
+      }
+      if(d.pct !== undefined){
+        setPct(d.pct);
+      }
+
+      if(d.status==='complete' && d.audioUrl) return d.audioUrl;
+      if(d.status==='error') throw new Error(d.error || 'Generation failed.');
+
+    } catch(err){
+      if(err.message.includes('Generation') || err.message.includes('flagged') || err.message.includes('Server')) throw err;
+      // Network hiccup — keep polling, don't give up
+      errorCount++;
+      if(errorCount > 10) throw new Error('Lost connection to server. Please refresh and try again.');
+    }
   }
-  throw new Error('Generation timed out — please try again.');
+  throw new Error('Generation timed out — the AI is very busy. Please try again in a moment.');
 }
 
 /* ── SHOW RESULT ── */
@@ -866,7 +887,7 @@ function friendly(msg){
   if(m.includes('401')||m.includes('auth'))return'Authentication failed. Check the KIE_API_KEY is set correctly on your Render server.';
   if(m.includes('402')||m.includes('credit')||m.includes('balance'))return'Insufficient Kie.ai credits. Top up your balance at kie.ai.';
   if(m.includes('429'))return'Rate limited — wait 30 seconds and try again.';
-  if(m.includes('timeout')||m.includes('timed'))return'Generation timed out — the AI may be busy. Please try again.';
+  if(m.includes('timeout')||m.includes('timed'))return msg; // show exact timeout message
   if(m.includes('50 mb')||m.includes('large'))return'File too large — maximum is 50 MB.';
   return msg;
 }
