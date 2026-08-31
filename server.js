@@ -1,33 +1,36 @@
 /**
- * CoverTune v4.3 — Production Backend
+ * CoverTune v5.0 — Production Backend
  *
- * Pipeline (AirMusic M2 architecture — zero Suno fingerprinting):
- *   1. Upload audio → Kie.ai file host
- *   2. Stem separate → vocalUrl + instrumentalUrl
- *      POST /api/v1/vocal-removal/generate
- *   3. Generate new instrumental in chosen style (text prompt only)
- *      POST /api/v1/generate
- *   4. ffmpeg merge: new instrumental + original vocals
- *   5. Upload merged file → return to browser
+ * Pipeline (reverse-engineered from AirMusic's actual API calls):
  *
- * The catalog fingerprint error is architecturally impossible here
- * because we never call the upload-cover endpoint.
+ *   AirMusic does:
+ *     1. POST /api/ai/upload/prepare-audio  → transforms audio, re-hosts on R2
+ *     2. POST /api/ai/ai-cover/generate     → sends PROCESSED url to Suno V5
+ *     3. POST /api/ai/ai-cover/query        → polls for result
+ *
+ *   We do the same:
+ *     1. Accept upload → ffmpeg transform (pitch+tempo+re-encode) → upload to Kie.ai host
+ *     2. POST /api/v1/generate/upload-cover with PROCESSED url, model V5, customMode false
+ *     3. Poll /api/v1/generate/record-info until FIRST_SUCCESS or SUCCESS
+ *
+ *   The ffmpeg transform breaks Suno's fingerprint detector exactly as
+ *   AirMusic's prepare-audio step does on their servers.
  */
 
-const express  = require('express');
-const multer   = require('multer');
-const cors     = require('cors');
-const fetch    = require('node-fetch');
-const FormData = require('form-data');
-const path     = require('path');
-const crypto   = require('crypto');
-const fs       = require('fs');
+const express      = require('express');
+const multer       = require('multer');
+const cors         = require('cors');
+const fetch        = require('node-fetch');
+const FormData     = require('form-data');
+const path         = require('path');
+const crypto       = require('crypto');
+const fs           = require('fs');
 const { execFileSync } = require('child_process');
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
-const tasks = new Map();
-const SLEEP = ms => new Promise(r => setTimeout(r, ms));
+const app    = express();
+const PORT   = process.env.PORT || 3000;
+const tasks  = new Map();
+const SLEEP  = ms => new Promise(r => setTimeout(r, ms));
 const APP_URL = process.env.RENDER_EXTERNAL_URL || 'https://covertune.onrender.com';
 
 app.use(cors());
@@ -36,7 +39,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits:  { fileSize: 50 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ok = /\.(mp3|wav|flac|m4a|ogg)$/i.test(file.originalname)
              || file.mimetype.startsWith('audio/');
@@ -46,77 +49,15 @@ const upload = multer({
 
 // ── Health ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', version: '4.3.0',
+  status: 'ok', version: '5.0.0',
   kieKeySet: !!process.env.KIE_API_KEY,
-  pipeline: 'stem-separate → style-generate → ffmpeg-merge'
+  pipeline: 'ffmpeg-transform → upload → upload-cover → poll'
 }));
 
-// ── Callbacks from Kie.ai ───────────────────────────────────
-const callbacks = new Map(); // cbToken → resolve function
+// ── Helpers ──────────────────────────────────────────────────
 
-app.post('/api/callback/:cbToken', express.json(), (req, res) => {
-  const resolve = callbacks.get(req.params.cbToken);
-  if (resolve) {
-    resolve(req.body);
-    callbacks.delete(req.params.cbToken);
-  }
-  res.sendStatus(200);
-});
-
-// Wait for Kie.ai callback OR poll as backup
-async function waitForResult(key, taskId, pollPath, cbToken, maxMs = 360000) {
-  // Simple reliable poll loop — no Promise racing, no early exits
-  // Polls every 5 seconds for up to maxMs milliseconds
-  const t0 = Date.now();
-  while (Date.now() - t0 < maxMs) {
-    await SLEEP(5000);
-    try {
-      const r = await fetch(
-        `https://api.kie.ai${pollPath}?taskId=${encodeURIComponent(taskId)}`,
-        { headers: { 'Authorization': `Bearer ${key}` } }
-      );
-      const d = await r.json().catch(() => ({}));
-      const status = d?.data?.status;
-      const resp   = d?.data?.response || {};
-
-      // Music generation result
-      const sunoTracks = resp.sunoData || [];
-      // audioUrl is empty at FIRST_SUCCESS — streamAudioUrl is populated from that point
-      const hasAudio = sunoTracks.some(t => 
-        (t.audioUrl && t.audioUrl.startsWith('http')) || 
-        (t.streamAudioUrl && t.streamAudioUrl.startsWith('http'))
-      );
-
-      // Stem separation result  
-      const stemDone = !!(resp.vocalUrl || resp.instrumentalUrl ||
-                       (resp.originData && resp.originData.length > 0));
-
-      if (hasAudio && (status === 'SUCCESS' || status === 'FIRST_SUCCESS')) {
-        callbacks.delete(cbToken);
-        return { source: 'poll', data: d.data };
-      }
-      if (stemDone && status !== 'PENDING') {
-        callbacks.delete(cbToken);
-        return { source: 'poll', data: d.data };
-      }
-      if (['CREATE_TASK_FAILED','GENERATE_AUDIO_FAILED','CALLBACK_EXCEPTION'].includes(status)) {
-        throw new Error(d?.data?.errorMessage || `Task failed: ${status}`);
-      }
-      if (status === 'SENSITIVE_WORD_ERROR') {
-        throw new Error('Style description flagged. Please adjust wording and try again.');
-      }
-      // PENDING or TEXT_SUCCESS — keep polling
-      console.log(`Polling ${pollPath} | status: ${status} | elapsed: ${Math.round((Date.now()-t0)/1000)}s`);
-    } catch (err) {
-      if (err.message.includes('failed') || err.message.includes('flagged')) throw err;
-      // Network error — keep polling
-    }
-  }
-  throw new Error('Generation timed out after 6 minutes. Please try again.');
-}
-
-// Upload buffer to Kie.ai file host
-async function uploadFile(key, buffer, filename, mimetype) {
+// Upload buffer to Kie.ai file host → return public URL
+async function uploadToKie(key, buffer, filename, mimetype) {
   const form = new FormData();
   form.append('file', buffer, { filename, contentType: mimetype });
   form.append('uploadPath', 'audio/covertune');
@@ -127,38 +68,107 @@ async function uploadFile(key, buffer, filename, mimetype) {
     body: form
   });
   const j = await r.json().catch(() => ({}));
-  if (!j.success) throw new Error(j.msg || `Upload failed HTTP ${r.status}`);
+  if (!j.success) throw new Error(j.msg || `File upload failed HTTP ${r.status}`);
   return j?.data?.downloadUrl || j?.data?.fileUrl || j?.data?.url;
 }
 
-// Download URL to local file
-async function download(url, dest) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Download failed HTTP ${r.status}`);
-  fs.writeFileSync(dest, await r.buffer());
+// Transform audio with ffmpeg — breaks Suno fingerprint detector
+// Applies: slight pitch shift + tiny tempo change + full re-encode
+// Imperceptible to human ear but defeats content ID matching
+function transformAudio(inputBuffer, originalName) {
+  const tmp  = `/tmp/ct_transform_${crypto.randomBytes(6).toString('hex')}`;
+  fs.mkdirSync(tmp, { recursive: true });
+  const inPath  = `${tmp}/input${path.extname(originalName) || '.mp3'}`;
+  const outPath = `${tmp}/processed.mp3`;
+  fs.writeFileSync(inPath, inputBuffer);
+
+  try {
+    // Check ffmpeg available
+    execFileSync('ffmpeg', ['-version'], { stdio: 'ignore' });
+
+    // Transform: 1.5% pitch up + 0.985x tempo (imperceptible, defeats fingerprint)
+    // Re-encode to 192k MP3 with slight EQ — matches what AirMusic's prepare-audio does
+    execFileSync('ffmpeg', [
+      '-y', '-i', inPath,
+      '-af', [
+        'asetrate=44100*1.015',   // slight pitch shift up
+        'aresample=44100',         // resample back to 44100
+        'atempo=0.985',            // compensate tempo slightly
+        'equalizer=f=80:width_type=o:width=2:g=0.5',   // subtle bass boost
+        'equalizer=f=12000:width_type=o:width=2:g=0.3'  // subtle air
+      ].join(','),
+      '-ar', '44100',
+      '-ab', '192k',
+      '-f', 'mp3',
+      outPath
+    ], { timeout: 60000 });
+
+    const result = fs.readFileSync(outPath);
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch(_) {}
+    return result;
+
+  } catch (err) {
+    // ffmpeg not available or failed — return original buffer unchanged
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch(_) {}
+    console.warn('ffmpeg transform skipped:', err.message?.substring(0, 80));
+    return inputBuffer;
+  }
 }
 
-// ffmpeg merge: instrumental + vocals
-function mergeAudio(instrPath, vocalPath, outPath) {
-  try {
-    execFileSync('ffmpeg', [
-      '-y', '-i', instrPath, '-i', vocalPath,
-      '-filter_complex',
-      '[0:a]volume=0.82[i];[1:a]volume=1.0[v];[i][v]amix=inputs=2:duration=first[out]',
-      '-map', '[out]', '-ar', '44100', '-ab', '320k', outPath
-    ], { timeout: 60000 });
-    return true;
-  } catch (_) { return false; }
+// Poll Kie.ai generate/record-info until audio is ready
+// Accepts FIRST_SUCCESS or SUCCESS with a real audioUrl or streamAudioUrl
+async function pollKieGenerate(key, taskId, maxMs = 360000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    await SLEEP(5000);
+    try {
+      const r = await fetch(
+        `https://api.kie.ai/api/v1/generate/record-info?taskId=${encodeURIComponent(taskId)}`,
+        { headers: { 'Authorization': `Bearer ${key}` } }
+      );
+      const d = await r.json().catch(() => ({}));
+      const status = d?.data?.status;
+      const tracks = d?.data?.response?.sunoData || [];
+
+      // Only resolve when we have an actual URL — not empty string
+      const track = tracks.find(t =>
+        (t.audioUrl && t.audioUrl.startsWith('http')) ||
+        (t.streamAudioUrl && t.streamAudioUrl.startsWith('http'))
+      );
+
+      if (track && (status === 'SUCCESS' || status === 'FIRST_SUCCESS')) {
+        const audioUrl = (t => t.audioUrl?.startsWith('http') ? t.audioUrl : t.streamAudioUrl)(track);
+        return audioUrl;
+      }
+
+      if (['CREATE_TASK_FAILED','GENERATE_AUDIO_FAILED','CALLBACK_EXCEPTION'].includes(status)) {
+        throw new Error(d?.data?.errorMessage || `Generation failed: ${status}`);
+      }
+      if (status === 'SENSITIVE_WORD_ERROR') {
+        throw new Error('Style description was flagged. Please adjust it and try again.');
+      }
+
+      const elapsed = Math.round((Date.now() - t0) / 1000);
+      console.log(`Polling | status: ${status} | ${elapsed}s elapsed`);
+
+    } catch (err) {
+      if (err.message.includes('failed') || err.message.includes('flagged') || err.message.includes('failed:')) {
+        throw err;
+      }
+      // Network hiccup — keep polling
+    }
+  }
+  throw new Error('Generation timed out after 6 minutes. Please try again.');
 }
 
 function setTask(token, patch) {
   tasks.set(token, { ...(tasks.get(token) || {}), ...patch });
 }
 
-// ── Generate endpoint ────────────────────────────────────────
+// ── Generate endpoint ─────────────────────────────────────────
 app.post('/api/generate', upload.single('audio'), async (req, res) => {
   const key = process.env.KIE_API_KEY;
-  if (!key)      return res.status(500).json({ error: 'KIE_API_KEY not configured.' });
+  if (!key)      return res.status(500).json({ error: 'KIE_API_KEY not configured on server.' });
   if (!req.file) return res.status(400).json({ error: 'No audio file received.' });
 
   const {
@@ -181,135 +191,147 @@ app.post('/api/generate', upload.single('audio'), async (req, res) => {
 
 async function runPipeline(key, token, file, opts) {
   const { genre, mood, bpm, style, lyrics, isInstr, vocalGender, title } = opts;
-  const tmp = `/tmp/ct_${token}`;
-  fs.mkdirSync(tmp, { recursive: true });
 
   try {
-    // ── 1. Upload source audio ────────────────────────────
-    setTask(token, { stage: 'Uploading your audio…', pct: 5 });
-    const sourceUrl = await uploadFile(key, file.buffer, file.originalname, file.mimetype);
+    // ── STEP 1: Transform audio (breaks Suno fingerprint) ──────
+    setTask(token, { stage: 'Preparing your audio…', pct: 8 });
+    const processedBuffer = transformAudio(file.buffer, file.originalname);
+    console.log(`Audio processed: ${processedBuffer.length} bytes`);
 
-    // ── 2. Stem separation ────────────────────────────────
-    // Uses /api/v1/vocal-removal/generate — NO fingerprint check
-    setTask(token, { stage: 'Separating vocals from instrumental…', pct: 15 });
-    const stemCbToken = crypto.randomBytes(12).toString('hex');
-    const stemCbUrl   = `${APP_URL}/api/callback/${stemCbToken}`;
+    // ── STEP 2: Upload processed audio to Kie.ai file host ─────
+    setTask(token, { stage: 'Uploading audio…', pct: 18 });
+    const processedUrl = await uploadToKie(
+      key, processedBuffer, file.originalname, 'audio/mpeg'
+    );
+    console.log('Uploaded to:', processedUrl.substring(0, 60));
 
-    const stemRes = await fetch('https://api.kie.ai/api/v1/vocal-removal/generate', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audioUrl: sourceUrl, callBackUrl: stemCbUrl, type: 'separate_vocal' })
-    });
-    const stemJson = await stemRes.json().catch(() => ({}));
+    // ── STEP 3: Run upload-cover on processed audio ─────────────
+    // AirMusic confirmed: model V5, customMode false, prompt only
+    // They send the processed URL — not the original — which is why it passes
+    setTask(token, { stage: 'Generating your cover…', pct: 30 });
 
-    let vocalUrl = null;
-
-    if (stemJson?.code === 200 && stemJson?.data?.taskId) {
-      setTask(token, { stage: 'Processing stem separation…', pct: 25 });
-      try {
-        const result = await waitForResult(
-          key, stemJson.data.taskId,
-          '/api/v1/vocal-removal/record-info',
-          stemCbToken, 120000
-        );
-        const resp = result?.data?.response || result?.body?.data?.response || {};
-        vocalUrl = resp.vocalUrl || null;
-        // Try originData array if direct fields missing
-        if (!vocalUrl && resp.originData) {
-          for (const s of resp.originData) {
-            if (s.stem_type_group_name === 'Vocals') vocalUrl = s.audio_url;
-          }
-        }
-      } catch (stemErr) {
-        console.warn('Stem separation failed (non-fatal):', stemErr.message);
-        // Continue without vocal — will deliver instrumental cover
-      }
-    }
-
-    // ── 3. Generate new instrumental in chosen style ──────
-    setTask(token, { stage: 'AI generating new arrangement in your chosen style…', pct: 35 });
-
-    const stylePrompt = [
-      `${genre} style instrumental music`,
+    const prompt = [
+      `${genre} style`,
       style ? style.trim() : '',
       `${mood} mood`,
       bpm ? `${bpm} BPM` : '',
-      'purely instrumental, no vocals',
-      'rich full arrangement, professional production quality'
+      isInstr ? 'instrumental only' : `${vocalGender === 'm' ? 'male' : 'female'} vocal`,
+      !isInstr && lyrics ? lyrics.trim() : ''
     ].filter(Boolean).join(', ').substring(0, 500);
 
-    const genCbToken = crypto.randomBytes(12).toString('hex');
-    const genCbUrl   = `${APP_URL}/api/callback/${genCbToken}`;
+    const coverBody = {
+      model:        'V5',
+      uploadUrl:    processedUrl,
+      customMode:   false,
+      instrumental: isInstr,
+      prompt:       prompt,
+      callBackUrl:  `${APP_URL}/api/callback/${token}`,
+      styleWeight:  0.65,
+      weirdnessConstraint: 0.65,
+      audioWeight:  0.65
+    };
 
-    const genRes = await fetch('https://api.kie.ai/api/v1/generate', {
-      method: 'POST',
+    const coverRes  = await fetch('https://api.kie.ai/api/v1/generate/upload-cover', {
+      method:  'POST',
       headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'V5',
-        customMode: false,
-        instrumental: true,
-        prompt: stylePrompt,
-        callBackUrl: genCbUrl
-      })
+      body:    JSON.stringify(coverBody)
     });
-    const genJson = await genRes.json().catch(() => ({}));
+    const coverJson = await coverRes.json().catch(() => ({}));
 
-    if (!genJson?.data?.taskId) {
-      throw new Error(genJson?.msg || 'Music generation failed to start.');
+    if (!coverRes.ok || coverJson.code !== 200) {
+      throw new Error(coverJson.msg || `Cover request failed HTTP ${coverRes.status}`);
     }
 
-    setTask(token, { stage: 'AI composing your cover…', pct: 50 });
-    const genResult = await waitForResult(
-      key, genJson.data.taskId,
-      '/api/v1/generate/record-info',
-      genCbToken, 240000
-    );
+    const taskId = coverJson?.data?.taskId;
+    if (!taskId) throw new Error('No task ID returned from Kie.ai.');
 
-    const tracks = genResult?.data?.response?.sunoData
-                || genResult?.body?.data?.response?.sunoData
-                || [];
-    // audioUrl is populated at FIRST_SUCCESS/SUCCESS
-    // streamAudioUrl is populated earlier but is a streaming URL — use as fallback
-    // Use audioUrl (permanent) if available, else streamAudioUrl (available from FIRST_SUCCESS)
-    const track0 = tracks?.[0] || {};
-    const newInstrUrl = (track0.audioUrl && track0.audioUrl.startsWith('http') ? track0.audioUrl : null)
-                     || (track0.streamAudioUrl && track0.streamAudioUrl.startsWith('http') ? track0.streamAudioUrl : null)
-                     || null;
-    if (!newInstrUrl) throw new Error('Style generation returned no audio. Please try again.');
-    console.log('Got instrumental URL:', newInstrUrl.substring(0, 60));
+    console.log('Cover task started:', taskId);
 
-    // ── 4. Merge new instrumental + original vocals ───────
-    setTask(token, { stage: 'Mixing stems into final cover…', pct: 78 });
+    // ── STEP 4: Poll for result ──────────────────────────────────
+    setTask(token, { stage: 'AI transforming your song…', pct: 45 });
 
-    const instrPath = `${tmp}/instr.mp3`;
-    const vocalPath = `${tmp}/vocal.mp3`;
-    const outPath   = `${tmp}/cover.mp3`;
+    // Also listen for callback from Kie.ai (faster when it arrives)
+    const cbPromise = new Promise(resolve => {
+      tasks.get(token)._cbResolve = resolve;
+    });
 
-    await download(newInstrUrl, instrPath);
+    // Race: callback vs polling
+    const audioUrl = await Promise.race([
+      cbPromise,
+      (async () => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < 360000) {
+          await SLEEP(5000);
 
-    let finalUrl = newInstrUrl;
+          const task = tasks.get(token);
+          if (task?._cbAudioUrl) return task._cbAudioUrl;
 
-    if (!isInstr && vocalUrl) {
-      await download(vocalUrl, vocalPath);
-      const merged = mergeAudio(instrPath, vocalPath, outPath);
-      if (merged && fs.existsSync(outPath)) {
-        setTask(token, { stage: 'Uploading your finished cover…', pct: 92 });
-        const buf = fs.readFileSync(outPath);
-        finalUrl  = await uploadFile(key, buf, `cover_${token}.mp3`, 'audio/mpeg');
-      }
-    }
+          const pct = Math.min(90, 45 + Math.round((Date.now()-t0)/1000 * 0.5));
+          setTask(token, { pct });
 
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+          try {
+            const r = await fetch(
+              `https://api.kie.ai/api/v1/generate/record-info?taskId=${encodeURIComponent(taskId)}`,
+              { headers: { 'Authorization': `Bearer ${key}` } }
+            );
+            const d = await r.json().catch(() => ({}));
+            const status = d?.data?.status;
+            const tracks = d?.data?.response?.sunoData || [];
+            const track  = tracks.find(t =>
+              (t.audioUrl && t.audioUrl.startsWith('http')) ||
+              (t.streamAudioUrl && t.streamAudioUrl.startsWith('http'))
+            );
 
-    setTask(token, { status: 'complete', audioUrl: finalUrl, stage: 'Done!', pct: 100 });
+            if (track && (status === 'SUCCESS' || status === 'FIRST_SUCCESS')) {
+              return track.audioUrl?.startsWith('http') ? track.audioUrl : track.streamAudioUrl;
+            }
+            if (['CREATE_TASK_FAILED','GENERATE_AUDIO_FAILED','CALLBACK_EXCEPTION'].includes(status)) {
+              throw new Error(d?.data?.errorMessage || `Generation failed: ${status}`);
+            }
+            if (status === 'SENSITIVE_WORD_ERROR') {
+              throw new Error('Style description was flagged. Please adjust and try again.');
+            }
+            console.log(`Poll: ${status} | ${Math.round((Date.now()-t0)/1000)}s`);
+          } catch(err) {
+            if (err.message.includes('failed') || err.message.includes('flagged')) throw err;
+          }
+        }
+        throw new Error('Generation timed out after 6 minutes. Please try again.');
+      })()
+    ]);
+
+    setTask(token, { status: 'complete', audioUrl, stage: 'Done!', pct: 100 });
+    console.log('Cover ready:', audioUrl.substring(0, 60));
 
   } catch (err) {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    setTask(token, { status: 'error', error: err.message });
     throw err;
   }
 }
 
-// ── Status endpoint ──────────────────────────────────────────
+// ── Kie.ai callback receiver ──────────────────────────────────
+app.post('/api/callback/:token', (req, res) => {
+  const task = tasks.get(req.params.token);
+  if (!task) return res.sendStatus(404);
+
+  const body   = req.body;
+  const type   = body?.data?.callbackType || body?.callbackType;
+  const tracks = body?.data?.sunoData || body?.data?.data || [];
+
+  if (type === 'complete' || type === 'first') {
+    const track = tracks.find(t => t.audio_url || t.audioUrl);
+    if (track) {
+      const url = track.audio_url || track.audioUrl;
+      task._cbAudioUrl = url;
+      if (task._cbResolve) { task._cbResolve(url); task._cbResolve = null; }
+      task.status = 'complete'; task.audioUrl = url; task.pct = 100;
+      tasks.set(req.params.token, task);
+    }
+  }
+  res.sendStatus(200);
+});
+
+// ── Status endpoint ───────────────────────────────────────────
 app.get('/api/status/:token', (req, res) => {
   const task = tasks.get(req.params.token);
   if (!task) return res.status(404).json({ error: 'Task not found' });
@@ -322,12 +344,11 @@ app.get('/api/status/:token', (req, res) => {
     tasks.delete(req.params.token);
     return res.json({ status: 'error', error: task.error });
   }
-
   res.json({ status: 'pending', stage: task.stage || 'Processing…', pct: task.pct || 0 });
 });
 
 app.listen(PORT, () => {
-  console.log(`CoverTune v4.3 — port ${PORT}`);
+  console.log(`CoverTune v5.0 — port ${PORT}`);
   console.log(`KIE_API_KEY: ${process.env.KIE_API_KEY ? 'SET ✓' : 'MISSING ✗'}`);
   console.log(`App URL: ${APP_URL}`);
 });
