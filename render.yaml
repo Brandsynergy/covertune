@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: covertune
+    runtime: node
+    buildCommand: apt-get install -y ffmpeg && npm install
+    startCommand: npm start
+    envVars:
+      - key: KIE_API_KEY
+        sync: false
