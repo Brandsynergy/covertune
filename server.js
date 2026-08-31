@@ -1,5 +1,5 @@
 /**
- * CoverTune v4.1 — Production Backend
+ * CoverTune v4.2 — Production Backend
  *
  * Pipeline (AirMusic M2 architecture — zero Suno fingerprinting):
  *   1. Upload audio → Kie.ai file host
@@ -46,7 +46,7 @@ const upload = multer({
 
 // ── Health ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', version: '4.1.0',
+  status: 'ok', version: '4.2.0',
   kieKeySet: !!process.env.KIE_API_KEY,
   pipeline: 'stem-separate → style-generate → ffmpeg-merge'
 }));
@@ -64,64 +64,51 @@ app.post('/api/callback/:cbToken', express.json(), (req, res) => {
 });
 
 // Wait for Kie.ai callback OR poll as backup
-async function waitForResult(key, taskId, pollPath, cbToken, maxMs = 240000) {
-  return new Promise(async (resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Task timed out after 4 minutes.')), maxMs);
+async function waitForResult(key, taskId, pollPath, cbToken, maxMs = 360000) {
+  // Simple reliable poll loop — no Promise racing, no early exits
+  // Polls every 5 seconds for up to maxMs milliseconds
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    await SLEEP(5000);
+    try {
+      const r = await fetch(
+        `https://api.kie.ai${pollPath}?taskId=${encodeURIComponent(taskId)}`,
+        { headers: { 'Authorization': `Bearer ${key}` } }
+      );
+      const d = await r.json().catch(() => ({}));
+      const status = d?.data?.status;
+      const resp   = d?.data?.response || {};
 
-    // Register callback listener
-    callbacks.set(cbToken, (body) => {
-      clearTimeout(timer);
-      resolve({ source: 'callback', body });
-    });
+      // Music generation result
+      const sunoTracks = resp.sunoData || [];
+      const hasAudio   = sunoTracks.some(t => t.audioUrl && t.audioUrl.startsWith('http'));
 
-    // Also poll actively every 6s as backup
-    let elapsed = 0;
-    while (elapsed < maxMs) {
-      await SLEEP(6000);
-      elapsed += 6000;
-      try {
-        const r = await fetch(
-          `https://api.kie.ai${pollPath}?taskId=${encodeURIComponent(taskId)}`,
-          { headers: { 'Authorization': `Bearer ${key}` } }
-        );
-        const d = await r.json().catch(() => ({}));
-        const status = d?.data?.status;
+      // Stem separation result  
+      const stemDone = !!(resp.vocalUrl || resp.instrumentalUrl ||
+                       (resp.originData && resp.originData.length > 0));
 
-        // TEXT_SUCCESS = text/lyrics done, audio NOT yet ready — keep polling
-        // FIRST_SUCCESS or SUCCESS = audio is ready
-        const sunoTracks = d?.data?.response?.sunoData || [];
-        const hasAudio = sunoTracks.some(t => t.audioUrl || t.streamAudioUrl);
-        const stemDone = !!(d?.data?.response?.vocalUrl || d?.data?.response?.instrumentalUrl
-                         || (d?.data?.response?.originData?.length > 0));
-
-        if ((status === 'SUCCESS' || status === 'FIRST_SUCCESS') && hasAudio) {
-          clearTimeout(timer);
-          callbacks.delete(cbToken);
-          resolve({ source: 'poll', data: d.data });
-          return;
-        }
-        if (status === 'complete' && stemDone) {
-          clearTimeout(timer);
-          callbacks.delete(cbToken);
-          resolve({ source: 'poll', data: d.data });
-          return;
-        }
-        if (['CREATE_TASK_FAILED','GENERATE_AUDIO_FAILED',
-             'CALLBACK_EXCEPTION','fail','failed','error'].includes(status)) {
-          clearTimeout(timer);
-          callbacks.delete(cbToken);
-          reject(new Error(d?.data?.errorMessage || `Task failed: ${status}`));
-          return;
-        }
-        if (status === 'SENSITIVE_WORD_ERROR') {
-          clearTimeout(timer);
-          callbacks.delete(cbToken);
-          reject(new Error('Style flagged — adjust your description and try again.'));
-          return;
-        }
-      } catch (_) { /* keep polling */ }
+      if (hasAudio && (status === 'SUCCESS' || status === 'FIRST_SUCCESS')) {
+        callbacks.delete(cbToken);
+        return { source: 'poll', data: d.data };
+      }
+      if (stemDone && status !== 'PENDING') {
+        callbacks.delete(cbToken);
+        return { source: 'poll', data: d.data };
+      }
+      if (['CREATE_TASK_FAILED','GENERATE_AUDIO_FAILED','CALLBACK_EXCEPTION'].includes(status)) {
+        throw new Error(d?.data?.errorMessage || `Task failed: ${status}`);
+      }
+      if (status === 'SENSITIVE_WORD_ERROR') {
+        throw new Error('Style description flagged. Please adjust wording and try again.');
+      }
+      // PENDING or TEXT_SUCCESS — keep polling
+      console.log(`Polling ${pollPath} | status: ${status} | elapsed: ${Math.round((Date.now()-t0)/1000)}s`);
+    } catch (err) {
+      if (err.message.includes('failed') || err.message.includes('flagged')) throw err;
+      // Network error — keep polling
     }
-  });
+  }
+  throw new Error('Generation timed out after 6 minutes. Please try again.');
 }
 
 // Upload buffer to Kie.ai file host
@@ -332,7 +319,7 @@ app.get('/api/status/:token', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`CoverTune v4.1 — port ${PORT}`);
+  console.log(`CoverTune v4.2 — port ${PORT}`);
   console.log(`KIE_API_KEY: ${process.env.KIE_API_KEY ? 'SET ✓' : 'MISSING ✗'}`);
   console.log(`App URL: ${APP_URL}`);
 });
