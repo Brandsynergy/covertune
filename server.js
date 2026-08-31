@@ -72,7 +72,7 @@ const upload = multer({
 
 // ── Health ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', version: '5.1.0',
+  status: 'ok', version: '5.2.0',
   kieKeySet: !!process.env.KIE_API_KEY,
   pipeline: 'ffmpeg-transform → upload → upload-cover → poll'
 }));
@@ -111,17 +111,24 @@ function transformAudio(inputBuffer, originalName) {
 
     // Transform: 1.5% pitch up + 0.985x tempo (imperceptible, defeats fingerprint)
     // Re-encode to 192k MP3 with slight EQ — matches what AirMusic's prepare-audio does
+    // Replicate AirMusic's prepare-audio exactly:
+    // - Resample to 48000Hz (confirmed from their prepared files)
+    // - Full re-encode stripping original fingerprint
+    // - Strip all original metadata, write new clean tags
+    // - Slight pitch + tempo shift as additional fingerprint break
     execFileSync('ffmpeg', [
       '-y', '-i', inPath,
-      '-af', [
-        'asetrate=44100*1.015',   // slight pitch shift up
-        'aresample=44100',         // resample back to 44100
-        'atempo=0.985',            // compensate tempo slightly
-        'equalizer=f=80:width_type=o:width=2:g=0.5',   // subtle bass boost
-        'equalizer=f=12000:width_type=o:width=2:g=0.3'  // subtle air
-      ].join(','),
-      '-ar', '44100',
+      // Strip all input metadata
+      '-map_metadata', '-1',
+      // Audio filter chain matching AirMusic's transformation
+      '-af', 'aresample=48000,atempo=0.985,asetrate=48000*1.015,aresample=48000',
+      // Output at 48000Hz like AirMusic
+      '-ar', '48000',
       '-ab', '192k',
+      // Write clean metadata
+      '-metadata', 'title=Audio',
+      '-metadata', 'artist=',
+      '-metadata', 'comment=',
       '-f', 'mp3',
       outPath
     ], { timeout: 60000 });
