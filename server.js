@@ -1,5 +1,5 @@
 /**
- * CoverTune v4.2 — Production Backend
+ * CoverTune v4.3 — Production Backend
  *
  * Pipeline (AirMusic M2 architecture — zero Suno fingerprinting):
  *   1. Upload audio → Kie.ai file host
@@ -46,7 +46,7 @@ const upload = multer({
 
 // ── Health ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', version: '4.2.0',
+  status: 'ok', version: '4.3.0',
   kieKeySet: !!process.env.KIE_API_KEY,
   pipeline: 'stem-separate → style-generate → ffmpeg-merge'
 }));
@@ -81,7 +81,11 @@ async function waitForResult(key, taskId, pollPath, cbToken, maxMs = 360000) {
 
       // Music generation result
       const sunoTracks = resp.sunoData || [];
-      const hasAudio   = sunoTracks.some(t => t.audioUrl && t.audioUrl.startsWith('http'));
+      // audioUrl is empty at FIRST_SUCCESS — streamAudioUrl is populated from that point
+      const hasAudio = sunoTracks.some(t => 
+        (t.audioUrl && t.audioUrl.startsWith('http')) || 
+        (t.streamAudioUrl && t.streamAudioUrl.startsWith('http'))
+      );
 
       // Stem separation result  
       const stemDone = !!(resp.vocalUrl || resp.instrumentalUrl ||
@@ -266,7 +270,11 @@ async function runPipeline(key, token, file, opts) {
                 || [];
     // audioUrl is populated at FIRST_SUCCESS/SUCCESS
     // streamAudioUrl is populated earlier but is a streaming URL — use as fallback
-    const newInstrUrl = tracks?.[0]?.audioUrl || tracks?.[0]?.streamAudioUrl || null;
+    // Use audioUrl (permanent) if available, else streamAudioUrl (available from FIRST_SUCCESS)
+    const track0 = tracks?.[0] || {};
+    const newInstrUrl = (track0.audioUrl && track0.audioUrl.startsWith('http') ? track0.audioUrl : null)
+                     || (track0.streamAudioUrl && track0.streamAudioUrl.startsWith('http') ? track0.streamAudioUrl : null)
+                     || null;
     if (!newInstrUrl) throw new Error('Style generation returned no audio. Please try again.');
     console.log('Got instrumental URL:', newInstrUrl.substring(0, 60));
 
@@ -319,7 +327,7 @@ app.get('/api/status/:token', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`CoverTune v4.2 — port ${PORT}`);
+  console.log(`CoverTune v4.3 — port ${PORT}`);
   console.log(`KIE_API_KEY: ${process.env.KIE_API_KEY ? 'SET ✓' : 'MISSING ✗'}`);
   console.log(`App URL: ${APP_URL}`);
 });
