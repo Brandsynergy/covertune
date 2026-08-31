@@ -1,5 +1,5 @@
 /**
- * CoverTune v5.0 — Production Backend
+ * CoverTune v5.1 — Production Backend
  *
  * Pipeline (reverse-engineered from AirMusic's actual API calls):
  *
@@ -29,8 +29,31 @@ const { execFileSync } = require('child_process');
 
 const app    = express();
 const PORT   = process.env.PORT || 3000;
-const tasks  = new Map();
-const SLEEP  = ms => new Promise(r => setTimeout(r, ms));
+const SLEEP      = ms => new Promise(r => setTimeout(r, ms));
+const TASKS_DIR  = '/tmp/covertune_tasks';
+const cbResolvers = new Map(); // in-memory only: Promise resolvers for active requests
+
+// Persistent task store — survives server restarts within same instance
+// Uses files so tasks survive brief restarts
+function ensureTasksDir() {
+  try { fs.mkdirSync(TASKS_DIR, { recursive: true }); } catch(_) {}
+}
+function saveTask(token, data) {
+  ensureTasksDir();
+  try { fs.writeFileSync(`${TASKS_DIR}/${token}.json`, JSON.stringify(data)); } catch(_) {}
+}
+function getTask(token) {
+  try { return JSON.parse(fs.readFileSync(`${TASKS_DIR}/${token}.json`, 'utf8')); } catch(_) { return null; }
+}
+function deleteTask(token) {
+  try { fs.unlinkSync(`${TASKS_DIR}/${token}.json`); } catch(_) {}
+}
+function setTask(token, patch) {
+  const current = getTask(token) || {};
+  const updated = { ...current, ...patch };
+  saveTask(token, updated);
+  return updated;
+}
 const APP_URL = process.env.RENDER_EXTERNAL_URL || 'https://covertune.onrender.com';
 
 app.use(cors());
@@ -49,7 +72,7 @@ const upload = multer({
 
 // ── Health ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', version: '5.0.0',
+  status: 'ok', version: '5.1.0',
   kieKeySet: !!process.env.KIE_API_KEY,
   pipeline: 'ffmpeg-transform → upload → upload-cover → poll'
 }));
@@ -161,9 +184,7 @@ async function pollKieGenerate(key, taskId, maxMs = 360000) {
   throw new Error('Generation timed out after 6 minutes. Please try again.');
 }
 
-function setTask(token, patch) {
-  tasks.set(token, { ...(tasks.get(token) || {}), ...patch });
-}
+// setTask defined above with file persistence
 
 // ── Generate endpoint ─────────────────────────────────────────
 app.post('/api/generate', upload.single('audio'), async (req, res) => {
@@ -252,7 +273,7 @@ async function runPipeline(key, token, file, opts) {
 
     // Also listen for callback from Kie.ai (faster when it arrives)
     const cbPromise = new Promise(resolve => {
-      tasks.get(token)._cbResolve = resolve;
+      cbResolvers.set(token, resolve);
     });
 
     // Race: callback vs polling
@@ -263,7 +284,7 @@ async function runPipeline(key, token, file, opts) {
         while (Date.now() - t0 < 360000) {
           await SLEEP(5000);
 
-          const task = tasks.get(token);
+          const task = getTask(token);
           if (task?._cbAudioUrl) return task._cbAudioUrl;
 
           const pct = Math.min(90, 45 + Math.round((Date.now()-t0)/1000 * 0.5));
@@ -311,7 +332,7 @@ async function runPipeline(key, token, file, opts) {
 
 // ── Kie.ai callback receiver ──────────────────────────────────
 app.post('/api/callback/:token', (req, res) => {
-  const task = tasks.get(req.params.token);
+  const task = getTask(req.params.token);
   if (!task) return res.sendStatus(404);
 
   const body   = req.body;
@@ -322,10 +343,9 @@ app.post('/api/callback/:token', (req, res) => {
     const track = tracks.find(t => t.audio_url || t.audioUrl);
     if (track) {
       const url = track.audio_url || track.audioUrl;
-      task._cbAudioUrl = url;
-      if (task._cbResolve) { task._cbResolve(url); task._cbResolve = null; }
-      task.status = 'complete'; task.audioUrl = url; task.pct = 100;
-      tasks.set(req.params.token, task);
+      const resolve = cbResolvers.get(req.params.token);
+      if (resolve) { resolve(url); cbResolvers.delete(req.params.token); }
+      saveTask(req.params.token, { ...task, status: 'complete', audioUrl: url, pct: 100 });
     }
   }
   res.sendStatus(200);
@@ -333,22 +353,22 @@ app.post('/api/callback/:token', (req, res) => {
 
 // ── Status endpoint ───────────────────────────────────────────
 app.get('/api/status/:token', (req, res) => {
-  const task = tasks.get(req.params.token);
+  const task = getTask(req.params.token);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
   if (task.status === 'complete') {
-    tasks.delete(req.params.token);
+    deleteTask(req.params.token);
     return res.json({ status: 'complete', audioUrl: task.audioUrl });
   }
   if (task.status === 'error') {
-    tasks.delete(req.params.token);
+    deleteTask(req.params.token);
     return res.json({ status: 'error', error: task.error });
   }
   res.json({ status: 'pending', stage: task.stage || 'Processing…', pct: task.pct || 0 });
 });
 
 app.listen(PORT, () => {
-  console.log(`CoverTune v5.0 — port ${PORT}`);
+  console.log(`CoverTune v5.1 — port ${PORT}`);
   console.log(`KIE_API_KEY: ${process.env.KIE_API_KEY ? 'SET ✓' : 'MISSING ✗'}`);
   console.log(`App URL: ${APP_URL}`);
 });
