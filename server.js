@@ -1,5 +1,5 @@
 /**
- * CoverTune v4.0 — Production Backend
+ * CoverTune v4.1 — Production Backend
  *
  * Pipeline (AirMusic M2 architecture — zero Suno fingerprinting):
  *   1. Upload audio → Kie.ai file host
@@ -46,7 +46,7 @@ const upload = multer({
 
 // ── Health ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', version: '4.0.0',
+  status: 'ok', version: '4.1.0',
   kieKeySet: !!process.env.KIE_API_KEY,
   pipeline: 'stem-separate → style-generate → ffmpeg-merge'
 }));
@@ -87,8 +87,20 @@ async function waitForResult(key, taskId, pollPath, cbToken, maxMs = 240000) {
         const d = await r.json().catch(() => ({}));
         const status = d?.data?.status;
 
-        if (status === 'SUCCESS' || status === 'FIRST_SUCCESS' ||
-            status === 'complete' || d?.data?.response?.vocalUrl) {
+        // TEXT_SUCCESS = text/lyrics done, audio NOT yet ready — keep polling
+        // FIRST_SUCCESS or SUCCESS = audio is ready
+        const sunoTracks = d?.data?.response?.sunoData || [];
+        const hasAudio = sunoTracks.some(t => t.audioUrl || t.streamAudioUrl);
+        const stemDone = !!(d?.data?.response?.vocalUrl || d?.data?.response?.instrumentalUrl
+                         || (d?.data?.response?.originData?.length > 0));
+
+        if ((status === 'SUCCESS' || status === 'FIRST_SUCCESS') && hasAudio) {
+          clearTimeout(timer);
+          callbacks.delete(cbToken);
+          resolve({ source: 'poll', data: d.data });
+          return;
+        }
+        if (status === 'complete' && stemDone) {
           clearTimeout(timer);
           callbacks.delete(cbToken);
           resolve({ source: 'poll', data: d.data });
@@ -265,8 +277,11 @@ async function runPipeline(key, token, file, opts) {
     const tracks = genResult?.data?.response?.sunoData
                 || genResult?.body?.data?.response?.sunoData
                 || [];
-    const newInstrUrl = tracks?.[0]?.audioUrl || tracks?.[0]?.streamAudioUrl;
+    // audioUrl is populated at FIRST_SUCCESS/SUCCESS
+    // streamAudioUrl is populated earlier but is a streaming URL — use as fallback
+    const newInstrUrl = tracks?.[0]?.audioUrl || tracks?.[0]?.streamAudioUrl || null;
     if (!newInstrUrl) throw new Error('Style generation returned no audio. Please try again.');
+    console.log('Got instrumental URL:', newInstrUrl.substring(0, 60));
 
     // ── 4. Merge new instrumental + original vocals ───────
     setTask(token, { stage: 'Mixing stems into final cover…', pct: 78 });
@@ -317,7 +332,7 @@ app.get('/api/status/:token', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`CoverTune v4.0 — port ${PORT}`);
+  console.log(`CoverTune v4.1 — port ${PORT}`);
   console.log(`KIE_API_KEY: ${process.env.KIE_API_KEY ? 'SET ✓' : 'MISSING ✗'}`);
   console.log(`App URL: ${APP_URL}`);
 });
